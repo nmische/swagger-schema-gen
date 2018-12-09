@@ -22,9 +22,10 @@ import (
 )
 
 var (
-	output     = flag.String("output", "", "output file name; if not file is given output is written to stdout")
-	trimprefix = flag.String("trimprefix", "", "trim the `prefix` from the generated schema object names")
-	buildTags  = flag.String("tags", "", "comma-separated list of build tags to apply")
+	output      = flag.String("output", "", "output file name; if not file is given output is written to stdout")
+	trimprefix  = flag.String("trimprefix", "", "a `prefix` to trim from the generated schema object names")
+	buildTags   = flag.String("tags", "", "comma-separated list of build tags to apply")
+	initialisms = flag.String("initialisms", "", "comma-separated list of initalism to lowercase in schema object property names")
 )
 
 // Usage is a replacement usage function for the flags package.
@@ -117,6 +118,7 @@ type File struct {
 	file      *ast.File  // Parsed AST.
 	src       []byte     // File content
 	generator *Generator // Generator associated with the file
+	name      string     // Name of the file
 }
 
 // Package holds pakage data.
@@ -124,6 +126,7 @@ type Package struct {
 	dir   string
 	name  string
 	files []*File
+	fs    *token.FileSet
 }
 
 func buildContext(tags []string) *build.Context {
@@ -182,11 +185,13 @@ func (g *Generator) parsePackage(directory string, names []string, text interfac
 			src:       content,
 			pkg:       g.pkg,
 			generator: g,
+			name:      name,
 		})
 	}
 	if len(astFiles) == 0 {
 		log.Fatalf("%s: no buildable Go files", directory)
 	}
+	g.pkg.fs = fs
 	g.pkg.name = astFiles[0].Name.Name
 	g.pkg.files = files
 	g.pkg.dir = directory
@@ -264,10 +269,25 @@ func (g *Generator) format() []byte {
 					continue
 				}
 				if p.Type != "" {
+
 					indent = indent + 2
 					g.Printf("%stype: %s\n", strings.Repeat(" ", indent), p.Type)
+					if p.Type == "array" {
+						g.Printf("%sitems:\n", strings.Repeat(" ", indent))
+						indent = indent + 2
+						if strings.HasPrefix(p.Items, "'#/components/schemas/") {
+							g.Printf("%s$ref: %s\n", strings.Repeat(" ", indent), p.Items)
+						} else {
+							g.Printf("%stype: %s\n", strings.Repeat(" ", indent), p.Items)
+						}
+						indent = indent - 2
+					}
 					indent = indent - 2
-					continue
+				}
+				if p.Format != "" {
+					indent = indent + 2
+					g.Printf("%sformat: %s\n", strings.Repeat(" ", indent), p.Format)
+					indent = indent - 2
 				}
 			}
 			indent = indent - 2
@@ -282,13 +302,11 @@ func (g *Generator) format() []byte {
 func (f *File) genObj(n ast.Node) bool {
 
 	g := f.generator
-	var offset token.Pos
+	offset := f.file.Pos()
 
 	switch node := n.(type) {
 
 	case *ast.TypeSpec:
-
-		offset = n.Pos()
 
 		ot := node.Name.Name
 
@@ -318,10 +336,16 @@ func (f *File) genObj(n ast.Node) bool {
 				t := node.Tag.Value
 				tag := reflect.StructTag(t[1 : len(t)-1])
 				j := tag.Get("json")
-				for _, i := range strings.Split(j, ",") {
-					if i != "omitempty" {
-						pn = i
+				if j != "" {
+					for _, i := range strings.Split(j, ",") {
+						if i != "omitempty" {
+							pn = i
+						}
 					}
+				}
+				// if json is "-" we should skip it
+				if pn == "-" {
+					return true
 				}
 			}
 
@@ -330,14 +354,16 @@ func (f *File) genObj(n ast.Node) bool {
 			}
 
 			// Get the type
-
-			tn := string(f.src[node.Type.Pos()-offset-1 : node.Type.End()-(offset)])
+			tn := string(f.src[node.Type.Pos()-offset : node.Type.End()-offset])
 			tn = strings.TrimSpace(tn)
+			tn = strings.TrimPrefix(tn, "*")
 
 			switch {
 			case strings.HasPrefix(tn, "[]"):
 				p.Type = "array"
-				switch ot := tn[2:]; ot {
+				ot := tn[2:]
+				ot = strings.TrimPrefix(ot, "*")
+				switch ot {
 				case "int":
 					p.Items = "integer"
 				case "string":
@@ -363,6 +389,10 @@ func (f *File) genObj(n ast.Node) bool {
 			case tn == "string":
 				p.Type = "string"
 
+			case tn == "time.Time":
+				p.Type = "string"
+				p.Format = "date-time"
+
 			default:
 				// Assume it is a type
 				ro := &Object{}
@@ -384,7 +414,7 @@ func (f *File) genObj(n ast.Node) bool {
 		// If we don't have a name this field is an embedded type
 		if node.Names == nil {
 
-			tn := string(f.src[node.Type.Pos()-offset-1 : node.Type.End()-(offset)])
+			tn := string(f.src[node.Type.Pos()-offset : node.Type.End()-offset])
 			tn = strings.TrimSpace(tn)
 			ro := &Object{}
 			if o, ok := g.objects[tn]; ok {
@@ -434,11 +464,28 @@ type Property struct {
 }
 
 // Helpers
+var commonInitialisms = []string{"API", "ASCII", "CPU", "CSS", "DNS", "EOF", "GUID", "HTML", "HTTP", "HTTPS", "ID", "IP", "JSON", "LHS", "QPS", "RAM", "RHS", "RPC", "SLA", "SMTP", "SSH", "TLS", "TTL", "UID", "UI", "UUID", "URI", "URL", "UTF8", "VM", "XML", "XSRF", "XSS"}
 
 func lowerFirst(s string) string {
 	if s == "" {
 		return ""
 	}
+
+	for _, i := range commonInitialisms {
+		if strings.HasPrefix(s, i) {
+			return strings.Replace(s, i, strings.ToLower(i), 1)
+		}
+	}
+
+	if len(*initialisms) > 0 {
+		customInitialisms := strings.Split(*initialisms, ",")
+		for _, i := range customInitialisms {
+			if strings.HasPrefix(s, i) {
+				return strings.Replace(s, i, strings.ToLower(i), 1)
+			}
+		}
+	}
+
 	r, n := utf8.DecodeRuneInString(s)
 	return string(unicode.ToLower(r)) + s[n:]
 }
